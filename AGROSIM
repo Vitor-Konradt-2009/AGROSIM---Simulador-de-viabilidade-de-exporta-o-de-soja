@@ -1,0 +1,434 @@
+import io
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import streamlit as st
+from numpy.typing import ArrayLike
+
+# =========================
+# Configurações globais (default)
+# =========================
+DEFAULT_CONFIG = {
+    "n_simulacoes": 10_000,
+    "dolar_volatilidade": 0.06,
+    "frete_export_volatilidade": 0.20,
+    "seed": 42,
+    "tolerancia_empate_rs": 1e-6,  # |Exp-Int| <= tolerância -> empate técnico
+}
+
+# Conversões
+BUSHEL_TO_TON = 0.0272  # 1 bushel soja ≈ 27,2 kg
+SACA_TO_TON = 0.06      # 1 saca de 60 kg = 0,06 ton
+
+
+# =========================
+# Cálculos de negócio
+# =========================
+def calcular_producao_total(alqueires: float, sacas_por_alqueire: float) -> tuple[float, float]:
+    sacas_totais = alqueires * sacas_por_alqueire
+    toneladas_totais = sacas_totais * SACA_TO_TON
+    return sacas_totais, toneladas_totais
+
+
+def receita_export_ton(preco_cbot: float | np.ndarray, premio: float | np.ndarray, dolar: float | np.ndarray) -> ArrayLike:
+    preco_total_usd_bushel = preco_cbot + premio
+    return (preco_total_usd_bushel / BUSHEL_TO_TON) * dolar
+
+
+def lucro_export_total(
+    preco_cbot: float | np.ndarray,
+    premio: float | np.ndarray,
+    dolar: float | np.ndarray,
+    frete_export_ton: float | np.ndarray,
+    taxas_export_ton: float | np.ndarray,
+    toneladas_totais: float,
+    custos_fixos_totais: float,
+) -> ArrayLike:
+    receita_ton = receita_export_ton(preco_cbot, premio, dolar)
+    margem_ton_antes_fixos = receita_ton - frete_export_ton - taxas_export_ton
+    return margem_ton_antes_fixos * toneladas_totais - custos_fixos_totais
+
+
+def lucro_interno_total(
+    preco_interno_saca: float,
+    custos_interno_ton: float,
+    toneladas_totais: float,
+    custos_fixos_totais: float,
+) -> float:
+    preco_interno_ton = preco_interno_saca / SACA_TO_TON
+    margem_ton_antes_fixos = preco_interno_ton - custos_interno_ton
+    return float(margem_ton_antes_fixos * toneladas_totais - custos_fixos_totais)
+
+
+# =========================
+# Simulação
+# =========================
+def lognormal_params(media: float, desvio: float) -> tuple[float, float]:
+    sigma2 = np.log(1 + (desvio / media) ** 2)
+    mu = np.log(media) - sigma2 / 2
+    return mu, np.sqrt(sigma2)
+
+
+def rodar_simulacao(entradas: dict, config: dict) -> tuple[pd.DataFrame, dict]:
+    rng = np.random.default_rng(int(config["seed"]))
+    n = int(config["n_simulacoes"])
+
+    sacas_totais, toneladas_totais = calcular_producao_total(
+        entradas["alqueires"], entradas["sacas_por_alqueire"]
+    )
+    custos_fixos_totais = entradas["insumos_total"] + entradas["assistencia_total"]
+
+    dolar_std = entradas["dolar_medio"] * config["dolar_volatilidade"]
+    frete_std = entradas["frete_export_medio"] * config["frete_export_volatilidade"]
+
+    mu_d, sig_d = lognormal_params(entradas["dolar_medio"], dolar_std)
+    mu_f, sig_f = lognormal_params(entradas["frete_export_medio"], frete_std)
+
+    dolar_sim = rng.lognormal(mu_d, sig_d, n)
+    frete_export_sim = rng.lognormal(mu_f, sig_f, n)
+
+    lucro_export_sim = lucro_export_total(
+        preco_cbot=entradas["preco_cbot"],
+        premio=entradas["premio_porto"],
+        dolar=dolar_sim,
+        frete_export_ton=frete_export_sim,
+        taxas_export_ton=entradas["taxas_export_ton"],
+        toneladas_totais=toneladas_totais,
+        custos_fixos_totais=custos_fixos_totais,
+    )
+
+    lucro_interno = lucro_interno_total(
+        preco_interno_saca=entradas["preco_interno_saca"],
+        custos_interno_ton=entradas["custos_interno_ton"],
+        toneladas_totais=toneladas_totais,
+        custos_fixos_totais=custos_fixos_totais,
+    )
+
+    df = pd.DataFrame({
+        "Dolar": dolar_sim,
+        "Frete_Export": frete_export_sim,
+        "Lucro_Export_Total": lucro_export_sim,
+        "Lucro_Interno_Total": lucro_interno,
+        "Diff_Export_Menos_Interno": lucro_export_sim - lucro_interno,
+    })
+
+    contexto = {
+        "sacas_totais": sacas_totais,
+        "toneladas_totais": toneladas_totais,
+        "custos_fixos_totais": custos_fixos_totais,
+        "lucro_interno_total": lucro_interno,
+        "n_simulacoes": n,
+        "tolerancia_empate_rs": config["tolerancia_empate_rs"],
+    }
+    return df, contexto
+
+
+# =========================
+# Estatísticas
+# =========================
+def analisar_resultados(df: pd.DataFrame, contexto: dict) -> dict:
+    lucro_export = df["Lucro_Export_Total"]
+    lucro_interno = contexto["lucro_interno_total"]
+    diff = df["Diff_Export_Menos_Interno"]
+
+    n = int(contexto["n_simulacoes"])
+    tol = float(contexto["tolerancia_empate_rs"])
+
+    prob_lucro_export = (lucro_export > 0).mean() * 100
+    prob_lucro_interno = 100.0 if lucro_interno > 0 else 0.0
+
+    mask_export_melhor = diff > tol
+    mask_interno_melhor = diff < -tol
+    mask_empate = ~(mask_export_melhor | mask_interno_melhor)
+
+    cen_export_melhor = int(mask_export_melhor.sum())
+    cen_interno_melhor = int(mask_interno_melhor.sum())
+    cen_empate = int(mask_empate.sum())
+
+    prob_export_melhor = cen_export_melhor / n * 100
+    prob_interno_melhor = cen_interno_melhor / n * 100
+    prob_empate = cen_empate / n * 100
+
+    return {
+        "sacas_totais": contexto["sacas_totais"],
+        "toneladas_totais": contexto["toneladas_totais"],
+        "custos_fixos_totais": contexto["custos_fixos_totais"],
+        "n_simulacoes": n,
+
+        "lucro_interno_total": lucro_interno,
+        "lucro_export_medio": float(lucro_export.mean()),
+        "lucro_export_p10": float(lucro_export.quantile(0.10)),
+        "lucro_export_p90": float(lucro_export.quantile(0.90)),
+        "lucro_export_std": float(lucro_export.std()),
+        "diff_media": float(diff.mean()),
+
+        "prob_lucro_export": float(prob_lucro_export),
+        "prob_lucro_interno": float(prob_lucro_interno),
+
+        "prob_export_melhor_que_interno": float(prob_export_melhor),
+        "prob_interno_melhor_que_export": float(prob_interno_melhor),
+        "prob_empate_tecnico": float(prob_empate),
+
+        "cenarios_export_melhor": cen_export_melhor,
+        "cenarios_interno_melhor": cen_interno_melhor,
+        "cenarios_empate_tecnico": cen_empate,
+    }
+
+
+# =========================
+# Gráficos
+# =========================
+def gerar_figura(df: pd.DataFrame, entradas: dict, contexto: dict):
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10), constrained_layout=True)
+    fig.suptitle("AGROSIM — Exportação vs Mercado Interno", fontsize=14, fontweight="bold")
+
+    cor_azul = "#1a73e8"
+    cor_verde = "#188038"
+    cor_vermelha = "#d93025"
+    formatter_reais = mticker.FuncFormatter(lambda x, _: f"R$ {x:,.0f}")
+
+    lucro_interno = contexto["lucro_interno_total"]
+    toneladas_totais = contexto["toneladas_totais"]
+    custos_fixos_totais = contexto["custos_fixos_totais"]
+
+    # 1) Histograma lucro exportação
+    ax1 = axes[0, 0]
+    ax1.hist(df["Lucro_Export_Total"], bins=50, color=cor_azul, edgecolor="white", alpha=0.85)
+    ax1.axvline(0, color=cor_vermelha, linestyle="--", linewidth=1.4, label="Break-even")
+    ax1.axvline(df["Lucro_Export_Total"].mean(), color="orange", linestyle="--", linewidth=1.4, label="Média export")
+    ax1.axvline(lucro_interno, color=cor_verde, linestyle="-.", linewidth=1.8, label="Lucro interno")
+    ax1.set_title("1) Distribuição do Lucro da Exportação")
+    ax1.set_xlabel("Lucro total (R$)")
+    ax1.set_ylabel("Frequência")
+    ax1.xaxis.set_major_formatter(formatter_reais)
+    ax1.tick_params(axis="x", rotation=20)
+    ax1.legend(fontsize=8)
+
+    # 2) Dispersão câmbio x lucro exportação
+    ax2 = axes[0, 1]
+    sc = ax2.scatter(
+        df["Dolar"], df["Lucro_Export_Total"],
+        c=df["Diff_Export_Menos_Interno"], cmap="RdYlGn",
+        alpha=0.35, s=9
+    )
+    ax2.axhline(lucro_interno, color=cor_verde, linestyle="-.", linewidth=1.4, label="Lucro interno")
+    ax2.axhline(0, color=cor_vermelha, linestyle="--", linewidth=1.2)
+    ax2.set_title("2) Câmbio vs Lucro da Exportação")
+    ax2.set_xlabel("Dólar (R$/US$)")
+    ax2.set_ylabel("Lucro total exportação (R$)")
+    ax2.yaxis.set_major_formatter(formatter_reais)
+    cbar = fig.colorbar(sc, ax=ax2, pad=0.02, fraction=0.05)
+    cbar.set_label("Export - Interno (R$)")
+    ax2.legend(fontsize=8)
+
+    # Curvas determinísticas para gráficos 3 e 4
+    dolar_min = entradas["dolar_medio"] * 0.75
+    dolar_max = entradas["dolar_medio"] * 1.25
+    dolar_range = np.linspace(dolar_min, dolar_max, 300)
+
+    lucro_export_range = lucro_export_total(
+        preco_cbot=entradas["preco_cbot"],
+        premio=entradas["premio_porto"],
+        dolar=dolar_range,
+        frete_export_ton=entradas["frete_export_medio"],
+        taxas_export_ton=entradas["taxas_export_ton"],
+        toneladas_totais=toneladas_totais,
+        custos_fixos_totais=custos_fixos_totais,
+    )
+    diff_range = lucro_export_range - lucro_interno
+
+    # 3) Vantagem exportação
+    ax3 = axes[1, 0]
+    vantagem_export = np.clip(diff_range, 0, None)
+    ax3.plot(dolar_range, vantagem_export, color=cor_verde, linewidth=2.5)
+    ax3.fill_between(dolar_range, 0, vantagem_export, color=cor_verde, alpha=0.18)
+    ax3.axvline(entradas["dolar_medio"], color="orange", linestyle="--", linewidth=1.2,
+                label=f"Dólar atual: R$ {entradas['dolar_medio']:.2f}")
+    ax3.set_title("3) Vantagem da Exportação")
+    ax3.set_xlabel("Dólar (R$/US$)")
+    ax3.set_ylabel("Quanto exportação ganha do interno (R$)")
+    ax3.yaxis.set_major_formatter(formatter_reais)
+    ax3.legend(fontsize=8)
+
+    # 4) Vantagem interno (eixo invertido para curva crescente)
+    ax4 = axes[1, 1]
+    dolar_range_inv = np.linspace(dolar_max, dolar_min, 300)
+    lucro_export_inv = lucro_export_total(
+        preco_cbot=entradas["preco_cbot"],
+        premio=entradas["premio_porto"],
+        dolar=dolar_range_inv,
+        frete_export_ton=entradas["frete_export_medio"],
+        taxas_export_ton=entradas["taxas_export_ton"],
+        toneladas_totais=toneladas_totais,
+        custos_fixos_totais=custos_fixos_totais,
+    )
+    vantagem_interno = np.clip(lucro_interno - lucro_export_inv, 0, None)
+    ax4.plot(dolar_range_inv, vantagem_interno, color=cor_vermelha, linewidth=2.5)
+    ax4.fill_between(dolar_range_inv, 0, vantagem_interno, color=cor_vermelha, alpha=0.18)
+    ax4.axvline(entradas["dolar_medio"], color="orange", linestyle="--", linewidth=1.2,
+                label=f"Dólar atual: R$ {entradas['dolar_medio']:.2f}")
+    ax4.set_title("4) Vantagem do Interno")
+    ax4.set_xlabel("Dólar (R$/US$) — eixo invertido")
+    ax4.set_ylabel("Quanto interno ganha da exportação (R$)")
+    ax4.yaxis.set_major_formatter(formatter_reais)
+    ax4.legend(fontsize=8)
+
+    return fig
+
+
+# =========================
+# Excel em memória para download
+# =========================
+def gerar_excel_em_memoria(df: pd.DataFrame, stats: dict, entradas: dict) -> bytes:
+    resumo = pd.DataFrame([{
+        "Produção (sacas)": round(stats["sacas_totais"], 2),
+        "Produção (ton)": round(stats["toneladas_totais"], 2),
+        "Custos Fixos Totais (R$)": round(stats["custos_fixos_totais"], 2),
+
+        "Lucro Interno Total (R$)": round(stats["lucro_interno_total"], 2),
+        "Lucro Export Médio (R$)": round(stats["lucro_export_medio"], 2),
+        "Dif Média Exp-Int (R$)": round(stats["diff_media"], 2),
+
+        "Export P10 (R$)": round(stats["lucro_export_p10"], 2),
+        "Export P90 (R$)": round(stats["lucro_export_p90"], 2),
+        "Export Std (R$)": round(stats["lucro_export_std"], 2),
+
+        "Prob Lucro Export (%)": round(stats["prob_lucro_export"], 2),
+        "Prob Lucro Interno (%)": round(stats["prob_lucro_interno"], 2),
+
+        "Prob Export Melhor (%)": round(stats["prob_export_melhor_que_interno"], 2),
+        "Prob Interno Melhor (%)": round(stats["prob_interno_melhor_que_export"], 2),
+        "Prob Empate Técnico (%)": round(stats["prob_empate_tecnico"], 2),
+
+        "Cenários Export Melhor": stats["cenarios_export_melhor"],
+        "Cenários Interno Melhor": stats["cenarios_interno_melhor"],
+        "Cenários Empate Técnico": stats["cenarios_empate_tecnico"],
+    }])
+
+    entradas_df = pd.DataFrame([entradas])
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.round(2).to_excel(writer, sheet_name="Simulacoes", index=False)
+        resumo.to_excel(writer, sheet_name="Resumo", index=False)
+        entradas_df.to_excel(writer, sheet_name="Entradas", index=False)
+
+    return output.getvalue()
+
+
+# =========================
+# Interface (Site Streamlit)
+# =========================
+def main():
+    st.set_page_config(page_title="AGROSIM Web", layout="wide")
+    st.title("🌱 AGROSIM — Exportação vs Mercado Interno")
+    st.caption("Simulação automática (Monte Carlo) — sem botão de iniciar: alterou input, recalculou.")
+
+    # Sidebar com inputs
+    st.sidebar.header("Entradas do modelo")
+
+    st.sidebar.subheader("Mercado externo")
+    preco_cbot = st.sidebar.number_input("Preço soja CBOT (US$/bushel)", min_value=0.0001, value=12.00, step=0.1)
+    premio_porto = st.sidebar.number_input("Prêmio de porto (US$/bushel)", value=0.50, step=0.1)
+    dolar_medio = st.sidebar.number_input("Dólar atual (R$/US$)", min_value=0.0001, value=5.20, step=0.01)
+    frete_export_medio = st.sidebar.number_input("Frete exportação médio (R$/ton)", min_value=0.0001, value=250.0, step=1.0)
+    taxas_export_ton = st.sidebar.number_input("Taxas exportação (R$/ton)", min_value=0.0, value=40.0, step=1.0)
+
+    st.sidebar.subheader("Produção")
+    alqueires = st.sidebar.number_input("Área plantada (alqueires)", min_value=0.0001, value=100.0, step=1.0)
+    sacas_por_alqueire = st.sidebar.number_input("Produtividade (sacas/alqueire)", min_value=0.0001, value=65.0, step=0.5)
+
+    st.sidebar.subheader("Custos fixos totais")
+    insumos_total = st.sidebar.number_input("Insumos totais (R$)", min_value=0.0, value=500_000.0, step=10_000.0)
+    assistencia_total = st.sidebar.number_input("Assistência técnica total (R$)", min_value=0.0, value=80_000.0, step=5_000.0)
+
+    st.sidebar.subheader("Mercado interno")
+    preco_interno_saca = st.sidebar.number_input("Preço interno (R$/saca)", min_value=0.0001, value=135.0, step=0.5)
+    custos_interno_ton = st.sidebar.number_input("Custos internos (R$/ton)", min_value=0.0, value=35.0, step=1.0)
+
+    st.sidebar.subheader("Parâmetros da simulação")
+    n_simulacoes = st.sidebar.slider("Nº de simulações", min_value=1000, max_value=50000, value=10000, step=1000)
+    dolar_vol = st.sidebar.slider("Volatilidade do dólar", min_value=0.01, max_value=0.30, value=0.06, step=0.01)
+    frete_vol = st.sidebar.slider("Volatilidade do frete export", min_value=0.01, max_value=0.50, value=0.20, step=0.01)
+    seed = st.sidebar.number_input("Seed", min_value=0, max_value=999999, value=42, step=1)
+
+    config = {
+        "n_simulacoes": n_simulacoes,
+        "dolar_volatilidade": dolar_vol,
+        "frete_export_volatilidade": frete_vol,
+        "seed": int(seed),
+        "tolerancia_empate_rs": DEFAULT_CONFIG["tolerancia_empate_rs"],
+    }
+
+    entradas = {
+        "preco_cbot": float(preco_cbot),
+        "premio_porto": float(premio_porto),
+        "dolar_medio": float(dolar_medio),
+        "frete_export_medio": float(frete_export_medio),
+        "taxas_export_ton": float(taxas_export_ton),
+        "alqueires": float(alqueires),
+        "sacas_por_alqueire": float(sacas_por_alqueire),
+        "insumos_total": float(insumos_total),
+        "assistencia_total": float(assistencia_total),
+        "preco_interno_saca": float(preco_interno_saca),
+        "custos_interno_ton": float(custos_interno_ton),
+    }
+
+    # Cálculo automático (sem botão)
+    df, contexto = rodar_simulacao(entradas, config)
+    stats = analisar_resultados(df, contexto)
+
+    # KPIs principais
+    st.subheader("Resumo rápido")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Produção (sacas)", f"{stats['sacas_totais']:,.0f}")
+    c2.metric("Produção (ton)", f"{stats['toneladas_totais']:,.2f}")
+    c3.metric("Lucro Interno Total", f"R$ {stats['lucro_interno_total']:,.2f}")
+    c4.metric("Lucro Export (médio)", f"R$ {stats['lucro_export_medio']:,.2f}")
+
+    st.subheader("Probabilidades (%)")
+    p1, p2, p3 = st.columns(3)
+    p1.metric("Exportação melhor", f"{stats['prob_export_melhor_que_interno']:.2f}%")
+    p2.metric("Interno melhor", f"{stats['prob_interno_melhor_que_export']:.2f}%")
+    p3.metric("Empate técnico", f"{stats['prob_empate_tecnico']:.2f}%")
+
+    st.caption(
+        f"Cenários: export melhor = {stats['cenarios_export_melhor']:,} | "
+        f"interno melhor = {stats['cenarios_interno_melhor']:,} | "
+        f"empate = {stats['cenarios_empate_tecnico']:,} "
+        f"(total = {stats['n_simulacoes']:,})"
+    )
+
+    # Recomendação
+    st.subheader("Recomendação")
+    p_exp = stats["prob_export_melhor_que_interno"]
+    if p_exp >= 60:
+        st.success("Recomendação: EXPORTAR (maior probabilidade de melhor resultado).")
+    elif p_exp >= 40:
+        st.warning("Recomendação: ZONA DE DECISÃO (equilíbrio entre risco e retorno).")
+    else:
+        st.info("Recomendação: MERCADO INTERNO tende a ser mais vantajoso.")
+
+    # Gráficos
+    st.subheader("Gráficos")
+    fig = gerar_figura(df, entradas, contexto)
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+    # Tabela
+    with st.expander("Ver amostra das simulações"):
+        st.dataframe(df.head(200), use_container_width=True)
+
+    # Download excel
+    excel_bytes = gerar_excel_em_memoria(df, stats, entradas)
+    st.download_button(
+        label="📥 Baixar resultado em Excel",
+        data=excel_bytes,
+        file_name="resultado_agrosim_comparativo.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+if __name__ == "__main__":
+    main()
